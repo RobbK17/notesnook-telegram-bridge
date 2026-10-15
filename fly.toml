@@ -1,0 +1,11 @@
+# Change this to a globally unique name, e.g. "yourname-notesnook-bot"
+app = "your-unique-app-name"
+primary_region = "iad"
+
+[build]
+
+# No [http_service]: the bot polls Telegram, so it needs no public port.
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
