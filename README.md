@@ -1,10 +1,12 @@
-# Telegram to Notesnook Bridge: Deployment Guide (v1.2)
+# Telegram to Notesnook Bridge: Deployment Guide (v1.3)
 
-Oct 15, 2026 · Robb Joseph
+Oct 15, 2026
 
 ## What you'll build
 
 You'll run a small private Telegram bot that saves every message you send it as a note in your Notesnook account, formatting, checklists, photos and text files included. The bot runs on Fly.io, so it keeps working when your own computer is off.
+
+It can also tag your notes from Telegram with `#tags`, and it sends you a backup of your tag list after every change, so a lost disk never costs you your tags. Tags are optional; skip them and the rest works the same.
 
 1. You send a message to your bot in Telegram.
 2. The bot, running on Fly.io, converts the message to HTML.
@@ -99,18 +101,23 @@ Env vars:
   ALLOWED_USER_ID      your numeric Telegram user ID (only you can use the bot)
   BOT_TIMEZONE         optional, default America/New_York (generic note titles)
   EMBED_MEDIA          optional, set to 0 to turn off embedding (placeholders only)
+  TAGS_FILE            optional, where saved tags live (default /data/tags.json
+                       when a Fly volume is mounted at /data)
+  NOTESNOOK_TAGS       optional, JSON of tag names to IDs used once to seed the file,
+                       e.g. {"groceries": "67aecf3b9e1398484554bc90"}
 """
 
 import asyncio
 import base64
 import html
+import io
 import json
 import os
 import re
 import subprocess
 import tempfile
 import threading
-from datetime import timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -132,7 +139,7 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 INBOX_KEY = os.environ["NOTESNOOK_INBOX_KEY"]
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 TIMEZONE = os.environ.get("BOT_TIMEZONE", "America/New_York")  # for generic titles
-__version__ = "1.2.0"  # bump when you change the bot; shown by /ver
+__version__ = "1.3.0"  # bump when you change the bot; shown by /ver
 
 ATTACHMENT_SIZE_LIMIT = 5 * 1024 * 1024  # per file, same as the email worker
 NOTE_SIZE_LIMIT = 8_000_000  # bytes of HTML per note (the Inbox API allows 10 MB)
@@ -371,7 +378,10 @@ async def embed_attachment(msg: Message) -> tuple[str | None, str | None]:
 
 
 def build_note(
-    msg: Message, attachment_html: str | None = None, problem: str | None = None
+    msg: Message,
+    attachment_html: str | None = None,
+    problem: str | None = None,
+    text_override: tuple[str, str] | None = None,
 ) -> tuple[str, str] | None:
     """Return (title, html) for a message, or None if there's nothing to save.
 
@@ -382,6 +392,8 @@ def build_note(
     label = media_label(msg)
     plain = (msg.text or msg.caption or "").strip()
     rich = (msg.text_html if msg.text else msg.caption_html) or ""
+    if text_override is not None:  # message with its #tag line removed
+        plain, rich = text_override
 
     if not plain and not label:
         return None
@@ -464,7 +476,153 @@ def _encrypt(plaintext: bytes) -> str:
     ).decode()
 
 
-def send_to_notesnook(title: str, content_html: str) -> requests.Response:
+TAG_NAME = re.compile(r"^[\w-]{1,40}$")
+TAG_ID = re.compile(r"^[A-Za-z0-9]{12,64}$")
+TAG_TOKEN = re.compile(r"^#[\w-]{1,40}$")
+TAGS_FILE = os.environ.get("TAGS_FILE") or (
+    "/data/tags.json" if os.path.isdir("/data") else "tags.json"
+)
+# True when the tag file sits on a mounted Fly volume, so it survives redeploys.
+TAGS_PERSISTENT = os.path.ismount(os.path.dirname(os.path.abspath(TAGS_FILE)))
+HISTORY_LIMIT = 500
+
+_tags_lock = threading.Lock()
+_tags_state: dict | None = None
+
+
+def _now_iso() -> str:
+    return datetime.now(ZoneInfo(TIMEZONE)).isoformat(timespec="seconds")
+
+
+def _save_tags_locked() -> None:
+    """Write the tag file atomically: temp file, then rename over the old one."""
+    folder = os.path.dirname(os.path.abspath(TAGS_FILE))
+    os.makedirs(folder, exist_ok=True)
+    tmp = TAGS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_tags_state, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, TAGS_FILE)
+
+
+def _tags_locked() -> dict:
+    """Load the tag file on first use. Caller must hold _tags_lock."""
+    global _tags_state
+    if _tags_state is not None:
+        return _tags_state
+    state: dict = {}
+    existed = os.path.exists(TAGS_FILE)
+    if existed:
+        try:
+            with open(TAGS_FILE, encoding="utf-8") as f:
+                state = json.load(f)
+            if not isinstance(state, dict) or not isinstance(state.get("tags", {}), dict):
+                raise ValueError("bad tag file")
+        except (OSError, ValueError):
+            try:  # keep the unreadable file instead of overwriting it
+                os.replace(TAGS_FILE, TAGS_FILE + ".corrupt")
+            except OSError:
+                pass
+            state, existed = {}, False
+    state.setdefault("tags", {})
+    state.setdefault("history", [])
+    _tags_state = state
+    if not existed:  # first run: optionally seed from the NOTESNOOK_TAGS secret
+        try:
+            seed = json.loads(os.environ.get("NOTESNOOK_TAGS", "") or "{}")
+        except ValueError:
+            seed = {}
+        for name, tag_id in (seed.items() if isinstance(seed, dict) else []):
+            name = str(name).lower().lstrip("#")
+            if TAG_NAME.match(name) and TAG_ID.match(str(tag_id)):
+                state["tags"][name] = str(tag_id)
+                state["history"].append({"at": _now_iso(), "action": "seed", "name": name})
+        try:
+            _save_tags_locked()
+        except OSError:
+            pass
+    return state
+
+
+def get_tags() -> dict:
+    with _tags_lock:
+        return dict(_tags_locked()["tags"])
+
+
+def tags_snapshot() -> dict:
+    with _tags_lock:
+        state = _tags_locked()
+        return {"tags": dict(state["tags"]), "history": list(state["history"])}
+
+
+def _log(state: dict, action: str, name: str) -> None:
+    state["history"].append({"at": _now_iso(), "action": action, "name": name})
+    del state["history"][:-HISTORY_LIMIT]
+
+
+def set_tag(name: str, tag_id: str) -> str:
+    with _tags_lock:
+        state = _tags_locked()
+        action = "updated" if name in state["tags"] else "added"
+        state["tags"][name] = tag_id
+        _log(state, action, name)
+        _save_tags_locked()
+        return action
+
+
+def remove_tag(name: str) -> bool:
+    with _tags_lock:
+        state = _tags_locked()
+        if name not in state["tags"]:
+            return False
+        del state["tags"][name]
+        _log(state, "removed", name)
+        _save_tags_locked()
+        return True
+
+
+def replace_tags(tags: dict) -> int:
+    with _tags_lock:
+        state = _tags_locked()
+        state["tags"] = dict(tags)
+        _log(state, "restored", f"{len(tags)} tags")
+        _save_tags_locked()
+        return len(tags)
+
+
+def extract_tag_line(msg: Message) -> tuple[list[str], tuple[str, str] | None]:
+    """Find a #tag line at the end of a message.
+
+    Returns (tag names, text_override). text_override is (plain, rich) with the
+    tag line removed, or None when the line should stay in the note (it is
+    only removed when every tag on it is known and the line can be cut cleanly).
+    Needs at least one other line of text, or media, so a message that is just
+    "#groceries" is saved as a normal note.
+    """
+    plain = msg.text or msg.caption or ""
+    lines = plain.rstrip().split("\n")
+    if len(lines) < 2 and not media_label(msg):
+        return [], None
+    tokens = lines[-1].split()
+    if not tokens or not all(TAG_TOKEN.match(t) for t in tokens):
+        return [], None
+    rest_plain = "\n".join(lines[:-1]).strip()
+    if not rest_plain and not media_label(msg):
+        return [], None
+    names = list(dict.fromkeys(t[1:].lower() for t in tokens))
+
+    if not all(n in get_tags() for n in names):
+        return names, None
+    rich = ((msg.text_html if msg.text else msg.caption_html) or "").rstrip()
+    rich_lines = rich.split("\n")
+    last_rich = html.unescape(re.sub(r"<[^>]+>", "", rich_lines[-1])).strip()
+    if len(rich_lines) != len(lines) or last_rich != lines[-1].strip():
+        return names, None
+    return names, (rest_plain, "\n".join(rich_lines[:-1]).strip())
+
+
+def send_to_notesnook(
+    title: str, content_html: str, tag_ids: list[str] | None = None
+) -> requests.Response:
     payload = {
         "title": title,
         "type": "note",
@@ -472,6 +630,8 @@ def send_to_notesnook(title: str, content_html: str) -> requests.Response:
         "version": 1,
         "content": {"type": "html", "data": content_html},
     }
+    if tag_ids:
+        payload["tagIds"] = tag_ids
     if not SERVER_URL:  # hosted Notesnook inbox: the proxy encrypts for us
         return requests.post(
             HOSTED_INBOX_URL,
@@ -504,7 +664,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if media_label(msg):
         attachment_html, problem = await embed_attachment(msg)
 
-    note = build_note(msg, attachment_html, problem)
+    tag_names, text_override = extract_tag_line(msg)
+    known = get_tags()
+    applied = [n for n in tag_names if n in known]
+    unknown = [n for n in tag_names if n not in known]
+
+    note = build_note(msg, attachment_html, problem, text_override)
     if note is None:
         await msg.reply_text("Nothing to save in that message.")
         return
@@ -512,10 +677,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if attachment_html and len(content_html.encode("utf-8")) > NOTE_SIZE_LIMIT:
         attachment_html, problem = None, "the note would be too large"
-        title, content_html = build_note(msg, None, problem)
+        title, content_html = build_note(msg, None, problem, text_override)
 
+    tag_ids = [known[n] for n in applied]
     try:
-        resp = await asyncio.to_thread(send_to_notesnook, title, content_html)
+        resp = await asyncio.to_thread(send_to_notesnook, title, content_html, tag_ids)
     except requests.RequestException as e:
         await msg.reply_text(f"Network error: {e}")
         return
@@ -524,7 +690,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         suffix = ""
         if media_label(msg):
             suffix = " (media embedded)" if attachment_html else f" (media not embedded: {problem})"
-        await msg.reply_text(f"✓ Saved to Notesnook{suffix}")
+        if applied:
+            suffix += f" (tags: {', '.join(applied)})"
+        text = f"✓ Saved to Notesnook{suffix}"
+        if unknown:
+            names = ", ".join("#" + n for n in unknown)
+            text += f"\nTag not found: {names}. Add it with /tag name id"
+        await msg.reply_text(text)
     else:
         await msg.reply_text(f"Failed ({resp.status_code}): {resp.text[:300]}")
 
@@ -537,6 +709,10 @@ COMMANDS
 /help   show this guide
 /setup  how to connect the bot to Notesnook (default or self-hosted)
 /ver    show the bot version and where notes are going
+/tag    save a tag: /tag name id
+/untag  forget a tag: /untag name
+/tags   list saved tags
+/tagsfile  send the saved tags as a backup file
 
 LISTS, TODOS AND HEADINGS
 Start a line with one of these:
@@ -562,6 +738,20 @@ Select text and use Telegram's formatting options to apply bold, italic, underli
 HTML
 Tags typed by hand, such as <b>, are not interpreted and appear in the note as plain text. Use Telegram's formatting options instead.
 
+TAGS
+Put tags on the last line of a message, after your text:
+Groceries:
+- [ ] milk
+
+#groceries #home
+
+The tag line is removed from the note and the matching Notesnook tags are applied. Tags only count on the last line, and the message needs other text above it.
+
+Notesnook can't list your tags, so save each one once. In Notesnook, right-click a tag and choose Copy ID, then send:
+/tag groceries 67aecf3b9e1398484554bc90
+
+A tag the bot doesn't know stays in the note as text, and the reply says it was not found. After every /tag and /untag the bot sends you the tag file. To restore it, send that file back with the caption /restore.
+
 PHOTOS AND FILES
 • Photos and image files (JPEG, PNG, GIF, WebP) are embedded in the note.
 • Text files (.txt, .md, .csv, .json, code and similar) are added as code blocks.
@@ -575,7 +765,7 @@ LIMITS
 • A message that contains a code block, a quote, or bold text spanning several lines is saved as simple text, without list conversion."""
 
 
-SETUP_TEXT = """Setup: connecting the bot to Notesnook (v1.2)
+SETUP_TEXT = """Setup: connecting the bot to Notesnook (v1.3)
 
 The bot can send notes to ONE of two places. Which one is decided by a single setting, NOTESNOOK_SERVER_URL.
 
@@ -628,6 +818,111 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(SETUP_TEXT)
 
 
+async def send_backup(msg: Message, reason: str) -> None:
+    """Send the tag file to the chat, so Telegram holds an off-Fly copy."""
+    try:
+        data = json.dumps(tags_snapshot(), indent=2, ensure_ascii=False).encode("utf-8")
+        stamp = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d_%H%M")
+        await msg.reply_document(
+            document=io.BytesIO(data),
+            filename=f"notesnook-tags-{stamp}.json",
+            caption=f"Tag backup ({reason}). To restore, send this file back with the caption /restore",
+        )
+    except Exception as e:  # never let a failed backup break the command
+        await msg.reply_text(f"Could not send the tag backup ({type(e).__name__}).")
+
+
+async def cmd_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    msg = update.effective_message
+    args = context.args or []
+    if len(args) != 2:
+        await msg.reply_text(
+            "Usage: /tag name id\n"
+            "Example: /tag groceries 67aecf3b9e1398484554bc90\n"
+            "In Notesnook, right-click the tag and choose Copy ID."
+        )
+        return
+    name, tag_id = args[0].lstrip("#").lower(), args[1].strip()
+    if not TAG_NAME.match(name):
+        await msg.reply_text("Tag names can use letters, numbers, - and _ (up to 40).")
+        return
+    if not TAG_ID.match(tag_id):
+        await msg.reply_text("That doesn't look like a tag ID. Use Copy ID in Notesnook.")
+        return
+    result = set_tag(name, tag_id)
+    await msg.reply_text(f'Tag "{name}" {result}.')
+    await send_backup(msg, f"after /tag {name}")
+
+
+async def cmd_untag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    msg = update.effective_message
+    args = context.args or []
+    if len(args) != 1:
+        await msg.reply_text("Usage: /untag name")
+        return
+    name = args[0].lstrip("#").lower()
+    if remove_tag(name):
+        await msg.reply_text(f'Tag "{name}" forgotten. It is not deleted in Notesnook.')
+        await send_backup(msg, f"after /untag {name}")
+    else:
+        await msg.reply_text(f'No saved tag named "{name}". Send /tags to see them.')
+
+
+async def cmd_tags(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    tags = get_tags()
+    if tags:
+        lines = [f"{n}  {i[:8]}…{i[-4:]}" for n, i in sorted(tags.items())]
+        text = "Saved tags:\n" + "\n".join(lines)
+    else:
+        text = "No tags saved yet. Add one with /tag name id."
+    if not TAGS_PERSISTENT:
+        text += (
+            "\n\nWarning: no Fly volume is mounted, so tags are lost when the bot "
+            "redeploys. Restore from your last backup file with /restore."
+        )
+    await update.effective_message.reply_text(text)
+
+
+async def cmd_tagsfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _authorized(update):
+        await send_backup(update.effective_message, "on request")
+
+
+async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A tag backup file sent with the caption /restore replaces the saved tags."""
+    if not _authorized(update):
+        return
+    msg = update.effective_message
+    doc = msg.document
+    if doc is None or (doc.file_size or 0) > 1_000_000:
+        await msg.reply_text("Send a tag backup file (under 1 MB) with the caption /restore.")
+        return
+    try:
+        tg_file = await doc.get_file()
+        data = json.loads(bytes(await tg_file.download_as_bytearray()).decode("utf-8"))
+        raw = data["tags"]
+        if not isinstance(raw, dict):
+            raise ValueError("tags must be an object")
+        clean = {
+            str(n).lower(): str(i)
+            for n, i in raw.items()
+            if TAG_NAME.match(str(n).lower()) and TAG_ID.match(str(i))
+        }
+        if raw and not clean:
+            raise ValueError("no valid tags")
+    except Exception:
+        await msg.reply_text("Could not read that file. Send a tag backup file with the caption /restore.")
+        return
+    count = replace_tags(clean)
+    await msg.reply_text(f"Restored {count} tags.")
+
+
 async def cmd_ver(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
@@ -635,6 +930,10 @@ async def cmd_ver(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if region := os.environ.get("FLY_REGION"):
         lines.append(f"Running on Fly.io (region: {region})")
     lines.append(f"Destination: {SERVER_URL or 'hosted Notesnook inbox'}")
+    lines.append(
+        f"Saved tags: {len(get_tags())} "
+        f"({'on a Fly volume' if TAGS_PERSISTENT else 'NOT persistent: no volume mounted'})"
+    )
     lines.append(f"Time zone for generic titles: {TIMEZONE}")
     lines.append(f"Media embedding: {'on' if EMBED_MEDIA else 'off'}")
     await update.effective_message.reply_text("\n".join(lines))
@@ -650,6 +949,10 @@ async def post_init(app: Application):
         [
             BotCommand("help", "How to use this bot"),
             BotCommand("setup", "Connect to default or self-hosted Notesnook"),
+            BotCommand("tag", "Save a tag: /tag name id"),
+            BotCommand("untag", "Forget a saved tag"),
+            BotCommand("tags", "List saved tags"),
+            BotCommand("tagsfile", "Send the tag backup file"),
             BotCommand("ver", "Show the bot version"),
         ]
     )
@@ -666,7 +969,14 @@ def main():
     )
     app.add_handler(CommandHandler(["start", "help"], cmd_help))
     app.add_handler(CommandHandler("setup", cmd_setup))
+    app.add_handler(CommandHandler("tag", cmd_tag))
+    app.add_handler(CommandHandler("untag", cmd_untag))
+    app.add_handler(CommandHandler("tags", cmd_tags))
+    app.add_handler(CommandHandler("tagsfile", cmd_tagsfile))
     app.add_handler(CommandHandler("ver", cmd_ver))
+    app.add_handler(
+        MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"^/restore\b"), cmd_restore)
+    )
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
     app.add_handler(MessageHandler(~filters.COMMAND, handle_message))
     app.run_polling()
@@ -721,7 +1031,15 @@ primary_region = "iad"
 [[vm]]
   size = "shared-cpu-1x"
   memory = "256mb"
+
+# Keeps saved tags (/data/tags.json) across restarts and deploys.
+# Create the volume once first: fly volumes create tagdata --region iad --size 1
+[mounts]
+  source = "tagdata"
+  destination = "/data"
 ```
+
+The `[mounts]` block attaches a small disk where the bot keeps your saved tags. It costs about 15 cents a month for the 1 GB minimum. If you don't want tags, delete the block and skip the volume step in Step 4. The bot still works, but tags saved with `/tag` are lost each time you redeploy. The volume's region must match `primary_region`.
 
 ### .dockerignore
 
@@ -758,17 +1076,24 @@ Run every command below from inside your project folder.
    Optional: to stop the bot embedding photos and files, and save a placeholder line instead, add `EMBED_MEDIA="0"` the same way.
 
    **Self-hosted only:** also set your server address. Use the key from your self-hosted account for `NOTESNOOK_INBOX_KEY`. Run `fly secrets set NOTESNOOK_SERVER_URL="https://notesnook.example.com"`. For default Notesnook, don't set it. If you set it earlier and want to switch back, run `fly secrets unset NOTESNOOK_SERVER_URL`.
-5. **Deploy.**
+
+   Optional: to load some tags the first time the bot runs, add `NOTESNOOK_TAGS='{"groceries": "67aecf3b9e1398484554bc90"}'`. It is only read when the tag file doesn't exist yet. After that, use `/tag` in Telegram.
+5. **Create the tag volume.** Do this once, before the first deploy, in the same region as `primary_region` in `fly.toml`:
+
+   ```bash
+   fly volumes create tagdata --region iad --size 1
+   ```
+6. **Deploy.**
 
    ```bash
    fly deploy
    ```
-6. **Keep it to one machine.** Fly may start two by default, and two copies polling Telegram will fight each other.
+7. **Keep it to one machine.** Fly may start two by default, and two copies polling Telegram will fight each other.
 
    ```bash
    fly scale count 1
    ```
-7. **Check that it's running.** `fly status` should show one machine in the `started` state, and `fly logs` should show no Python errors.
+8. **Check that it's running.** `fly status` should show one machine in the `started` state, and `fly logs` should show no Python errors.
 
 Fly may warn that nothing is listening on a port. You can ignore that, because the bot connects out to Telegram and doesn't serve a website. If it warns that your build context is huge, you're deploying from a crowded folder; move the five files into their own folder.
 
@@ -796,6 +1121,8 @@ You should get a note titled "Groceries" containing a checklist whose header als
 
 **Self-hosted:** send `/ver` first and check that Destination shows your server address. Then send a test message. "✓ Saved to Notesnook" means your server accepted the encrypted note. Sync Notesnook while logged in to the self-hosted account to see it.
 
+**Tags (optional):** send `/ver`; it should say `Saved tags: 0 (on a Fly volume)`. In Notesnook, right-click a tag and choose **Copy ID**, then send `/tag groceries <the id>`. The bot confirms and sends you a backup file. Then send a note whose last line is `#groceries`. The reply should end with "(tags: groceries)", and the note should carry that tag after a sync.
+
 Two last checks:
 
 - Run `fly machine restart`, wait about 10 seconds, and send another message. The bot should answer without any extra steps.
@@ -819,6 +1146,12 @@ Formatting you apply in Telegram (bold, italic, underline, strikethrough, links,
 **Commands.** Send `/help` to see a usage guide inside Telegram, including these markdown shortcuts. Send `/ver` to see the bot's version, the Fly.io region it runs in, its time zone and whether media embedding is on.
 
 **Setup help.** Send `/setup` for a short guide to connecting the bot to default or self-hosted Notesnook, including where to create the key and which secrets to set.
+
+**Tags.** Put tags on the last line of a message, after your text, for example `#groceries #home`. The bot removes that line from the note and applies the matching Notesnook tags. A `#word` anywhere else is ordinary text, and a message that is only a tag is saved as a normal note.
+
+Notesnook gives the bot no way to read your tag list, so you save each tag once with `/tag name id`. Copy the ID in Notesnook by right-clicking the tag and choosing **Copy ID**. `/untag name` forgets a tag in the bot only; it never deletes it in Notesnook. `/tags` lists what is saved. A tag the bot doesn't know stays in the note as text, and the reply says it wasn't found.
+
+**Tag backups.** After every `/tag` and `/untag`, the bot sends you the tag file in Telegram. `/tagsfile` sends it on request. To restore, send the file back to the bot with the caption `/restore`. Fly also keeps daily snapshots of the volume for 5 days by default, but the copy in your chat is the one that survives losing the volume.
 
 **Checklist headers.** Notesnook shows a header row above every checklist. Put a line directly above your todos, with no blank line between, and it becomes that header's title:
 
@@ -861,6 +1194,16 @@ Start with `fly logs`. It shows startup errors and every request the bot handles
 | `/ver` still shows "hosted Notesnook inbox" | `NOTESNOOK_SERVER_URL` is not set | Run `fly secrets set NOTESNOOK_SERVER_URL="https://notesnook.example.com"` |
 | Reply says "Saved" but no note appears | Notesnook is logged in to a different account, or has not synced | Log in to the self-hosted account and force a sync |
 | Logs mention `gpg failed` | `gnupg` is missing from the image | Use the Dockerfile in this guide and run `fly deploy` again |
+
+### Tags
+
+| What you see | Likely cause | Fix |
+| --- | --- | --- |
+| Reply says "Tag not found" | The tag was never saved in the bot | Send `/tag name id` with the ID copied from Notesnook |
+| The `#tag` line stays in the note | The tag isn't saved yet, or the line isn't the last line | Save the tag, and put the tags alone on the last line |
+| Note saved but has no tag | Wrong tag ID, or it is from a different account | Copy the ID again from the account the bot sends to |
+| `/ver` says "NOT persistent: no volume mounted" | The volume isn't attached | Check the `[mounts]` block in `fly.toml`, then run `fly deploy` |
+| Tags vanish after a deploy | The same: no volume | Create the volume, redeploy, then send the backup file back with `/restore` |
 
 **Update the bot.** Edit `bot.py` and run `fly deploy` again.
 
