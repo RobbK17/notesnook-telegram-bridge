@@ -11,6 +11,8 @@ notes and other files get a placeholder line (plus the caption, if any).
 Env vars:
   TELEGRAM_BOT_TOKEN   token from @BotFather
   NOTESNOOK_INBOX_KEY  key from Notesnook > Settings > Account > Inbox
+  NOTESNOOK_SERVER_URL optional, self-hosted sync server, e.g.
+                       https://notesnook.example.com (unset = hosted inbox)
   ALLOWED_USER_ID      your numeric Telegram user ID (only you can use the bot)
   BOT_TIMEZONE         optional, default America/New_York (generic note titles)
   EMBED_MEDIA          optional, set to 0 to turn off embedding (placeholders only)
@@ -19,8 +21,12 @@ Env vars:
 import asyncio
 import base64
 import html
+import json
 import os
 import re
+import subprocess
+import tempfile
+import threading
 from datetime import timezone
 from zoneinfo import ZoneInfo
 
@@ -34,12 +40,16 @@ from telegram.ext import (
     filters,
 )
 
-INBOX_URL = "https://inbox.notesnook.com/"
+HOSTED_INBOX_URL = "https://inbox.notesnook.com/"
+# Self-hosted sync server address, e.g. https://notesnook.example.com
+# When set, notes are PGP-encrypted here and sent to <server>/inbox/items.
+# When empty, the bot uses the hosted Notesnook inbox as before.
+SERVER_URL = os.environ.get("NOTESNOOK_SERVER_URL", "").strip().rstrip("/")
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 INBOX_KEY = os.environ["NOTESNOOK_INBOX_KEY"]
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 TIMEZONE = os.environ.get("BOT_TIMEZONE", "America/New_York")  # for generic titles
-__version__ = "1.1.0"  # bump when you change the bot; shown by /ver
+__version__ = "1.2.0"  # bump when you change the bot; shown by /ver
 
 ATTACHMENT_SIZE_LIMIT = 5 * 1024 * 1024  # per file, same as the email worker
 NOTE_SIZE_LIMIT = 8_000_000  # bytes of HTML per note (the Inbox API allows 10 MB)
@@ -319,6 +329,58 @@ def build_note(
     return title, "".join(body_parts)
 
 
+_gpg_home: str | None = None
+_gpg_fpr: str | None = None
+_gpg_lock = threading.Lock()
+
+
+def _gpg(*args: str, stdin: bytes | None = None) -> bytes:
+    proc = subprocess.run(
+        ["gpg", "--batch", "--yes", "--homedir", _gpg_home, *args],
+        input=stdin,
+        capture_output=True,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"gpg failed: {proc.stderr.decode(errors='replace')[:200]}")
+    return proc.stdout
+
+
+def _ensure_public_key(refresh: bool = False) -> str:
+    """Fetch the account's inbox public key from the server and import it."""
+    global _gpg_home, _gpg_fpr
+    with _gpg_lock:
+        if _gpg_fpr and not refresh:
+            return _gpg_fpr
+        if _gpg_home is None:
+            _gpg_home = tempfile.mkdtemp(prefix="gnupg-")
+            os.chmod(_gpg_home, 0o700)
+        r = requests.get(
+            f"{SERVER_URL}/inbox/public-encryption-key",
+            headers={"Authorization": INBOX_KEY},
+            timeout=20,
+        )
+        r.raise_for_status()
+        key_text = r.json()["key"] if r.headers.get(
+            "content-type", ""
+        ).startswith("application/json") else r.text
+        _gpg("--import", stdin=key_text.encode())
+        listing = _gpg("--list-keys", "--with-colons").decode()
+        _gpg_fpr = next(
+            line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:")
+        )
+        return _gpg_fpr
+
+
+def _encrypt(plaintext: bytes) -> str:
+    fpr = _ensure_public_key()
+    return _gpg(
+        "--trust-model", "always", "--armor", "--cipher-algo", "AES256",
+        "-r", fpr, "-e",
+        stdin=plaintext,
+    ).decode()
+
+
 def send_to_notesnook(title: str, content_html: str) -> requests.Response:
     payload = {
         "title": title,
@@ -327,9 +389,24 @@ def send_to_notesnook(title: str, content_html: str) -> requests.Response:
         "version": 1,
         "content": {"type": "html", "data": content_html},
     }
+    if not SERVER_URL:  # hosted Notesnook inbox: the proxy encrypts for us
+        return requests.post(
+            HOSTED_INBOX_URL,
+            json=payload,
+            headers={"Authorization": INBOX_KEY},
+            timeout=20,
+        )
+
+    plaintext = json.dumps(payload).encode("utf-8")
+    try:
+        cipher = _encrypt(plaintext)
+    except Exception:
+        _ensure_public_key(refresh=True)  # key may have been rotated; retry once
+        cipher = _encrypt(plaintext)
+    envelope = {"v": 1, "alg": "pgp-aes256", "cipher": cipher}
     return requests.post(
-        INBOX_URL,
-        json=payload,
+        f"{SERVER_URL}/inbox/items",
+        json=envelope,
         headers={"Authorization": INBOX_KEY},
         timeout=20,
     )
@@ -374,8 +451,9 @@ HELP_TEXT = """Telegram -> Notesnook bridge
 Send this bot a message to save it as a note in Notesnook. Notes appear in Notesnook after its next sync.
 
 COMMANDS
-/help  show this guide
-/ver   show the bot version
+/help   show this guide
+/setup  how to connect the bot to Notesnook (default or self-hosted)
+/ver    show the bot version and where notes are going
 
 LISTS, TODOS AND HEADINGS
 Start a line with one of these:
@@ -414,6 +492,44 @@ LIMITS
 • A message that contains a code block, a quote, or bold text spanning several lines is saved as simple text, without list conversion."""
 
 
+SETUP_TEXT = """Setup: connecting the bot to Notesnook (v1.2)
+
+The bot can send notes to ONE of two places. Which one is decided by a single setting, NOTESNOOK_SERVER_URL.
+
+OPTION A: DEFAULT NOTESNOOK (hosted)
+Use this if you sync with Notesnook's own servers.
+1. In Notesnook: Settings > Account > Inbox, turn it on and create an Inbox API key.
+2. Set the key on the bot:
+   fly secrets set NOTESNOOK_INBOX_KEY=<your key>
+3. Leave NOTESNOOK_SERVER_URL unset. If it was set before, remove it:
+   fly secrets unset NOTESNOOK_SERVER_URL
+4. /ver should say: Destination: hosted Notesnook inbox
+Notesnook's server encrypts your notes for you.
+
+OPTION B: SELF-HOSTED NOTESNOOK
+Use this if you run your own sync server.
+1. Log in to the Notesnook app that is connected to YOUR server (not the default one). The key must come from this account.
+2. Open Settings > Account > Inbox, turn it on, and create an Inbox API key. Copy it so you can paste it in the next step.
+3. Set both settings on the bot. Use your own server address, with no slash at the end:
+   fly secrets set NOTESNOOK_SERVER_URL=https://notesnook.example.com
+   fly secrets set NOTESNOOK_INBOX_KEY=<your self-hosted key>
+4. Deploy the new code: fly deploy
+5. /ver should show your server address under Destination.
+6. Send a test message, then sync Notesnook.
+
+IMPORTANT FOR SELF-HOSTED
+- A key from the default Notesnook account will NOT work on your server (the bot reports 401). Create a new key on the self-hosted account.
+- The bot encrypts every note with your account's public key before sending. It fetches that key from your server on its own using the Inbox key. You do not paste any other key.
+- The server address is the main sync address (the notesnook. host), not the auth, events, monograph or attachments addresses.
+- If you reset your self-hosted account's encryption keys, create a new Inbox key and set it again. The bot re-fetches the public key automatically.
+
+TROUBLESHOOTING
+401  wrong or missing key, or key from the other account
+404  wrong server address
+Network error  server is unreachable
+Saved but no note  sync Notesnook; check you are logged in to the matching account"""
+
+
 def _authorized(update: Update) -> bool:
     user = update.effective_user
     return user is not None and user.id == ALLOWED_USER_ID
@@ -424,12 +540,18 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(HELP_TEXT)
 
 
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _authorized(update):
+        await update.effective_message.reply_text(SETUP_TEXT)
+
+
 async def cmd_ver(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
     lines = [f"Telegram -> Notesnook bridge v{__version__}"]
     if region := os.environ.get("FLY_REGION"):
         lines.append(f"Running on Fly.io (region: {region})")
+    lines.append(f"Destination: {SERVER_URL or 'hosted Notesnook inbox'}")
     lines.append(f"Time zone for generic titles: {TIMEZONE}")
     lines.append(f"Media embedding: {'on' if EMBED_MEDIA else 'off'}")
     await update.effective_message.reply_text("\n".join(lines))
@@ -444,6 +566,7 @@ async def post_init(app: Application):
     await app.bot.set_my_commands(
         [
             BotCommand("help", "How to use this bot"),
+            BotCommand("setup", "Connect to default or self-hosted Notesnook"),
             BotCommand("ver", "Show the bot version"),
         ]
     )
@@ -459,6 +582,7 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler(["start", "help"], cmd_help))
+    app.add_handler(CommandHandler("setup", cmd_setup))
     app.add_handler(CommandHandler("ver", cmd_ver))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
     app.add_handler(MessageHandler(~filters.COMMAND, handle_message))
