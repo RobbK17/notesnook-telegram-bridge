@@ -1,12 +1,14 @@
-# Telegram to Notesnook Bridge: Deployment Guide (v1.3)
+# Telegram to Notesnook Bridge: Deployment Guide (v1.4)
 
-Oct 15, 2026
+Oct 18, 2026
 
 ## What you'll build
 
 You'll run a small private Telegram bot that saves every message you send it as a note in your Notesnook account, formatting, checklists, photos and text files included. The bot runs on Fly.io, so it keeps working when your own computer is off.
 
 It can also tag your notes from Telegram with `#tags`, and it sends you a backup of your tag list after every change, so a lost disk never costs you your tags. Tags are optional; skip them and the rest works the same.
+
+Beyond plain messages, the bot has commands for saving raw HTML (`/html`), saving callout boxes (`/callout`) and choosing how todos are saved (`/todostyle`).
 
 1. You send a message to your bot in Telegram.
 2. The bot, running on Fly.io, converts the message to HTML.
@@ -21,6 +23,63 @@ The whole setup takes about 30 minutes. You need:
 - A computer with a terminal. You don't need to install Python locally; Fly builds the bot for you.
 
 The bot only answers you. Anyone else who finds it is ignored.
+
+## What's new in v1.4.0
+
+Version 1.4.0 fixes the checklist header count, adds three commands (`/html`, `/callout` and `/todostyle`) and adds syntax highlighting for embedded code files. It needs no new secrets and no new dependencies. `requirements.txt`, the `Dockerfile` and `fly.toml` are unchanged.
+
+### Fixes
+
+- **Checklist header count.** Todos are now saved with the classes Notesnook itself uses (`checklist--item`, plus `checked` when done). Before, the checklist header could show `0/2` even when an item was checked, because the bot left off the `checklist--item` class that the header counts.
+- **`/help` and `/setup` too long for Telegram.** Telegram rejects messages over 4,096 characters, and `/help` had grown past that. Both commands now split at blank lines into several messages when needed, with no text lost.
+
+### New commands
+
+- **`/html`** saves the HTML after the command exactly as typed. Normal messages escape any tags you type, so use this when you want real HTML.
+  - The note title is the first heading (`<h1>` to `<h6>`), or the date and time if there is none.
+  - A `#tag` on the last line works as usual.
+  - Every tag must be closed. The bot refuses to save HTML with an unclosed or mismatched tag, because Notesnook would turn the whole note into a code block.
+  - Example: `/html <h1>Groceries</h1><ul class="checklist"><li class="checklist--item">milk</li></ul>`
+- **`/callout`** saves a Notesnook callout box.
+  - One-message form: `/callout warning Back up first`, then the body on the next lines.
+  - Sent on its own, the bot asks for the type, the title and the text, one message each. Send `skip` to leave a step out and `/cancel` to stop. An unanswered prompt expires after 5 minutes.
+  - Types: note, abstract, summary, tldr, info, todo, tip, hint, important, success, check, done, question, help, faq, warning, warn, caution, attention, failure, fail, missing, danger, error, bug, example, quote, cite. No type, or an unknown one, gives `info`. No title uses the type name in capitals.
+  - The body can use lists, todos and Telegram formatting. The whole message becomes the callout, and the note title is the callout title.
+  - Tags work at the end of the title line, at the end of the last line, or on a line of their own. Saved tags are applied and removed from the text. An unknown tag stays in the text and the reply says it was not found.
+  - A title that starts with a type word is read as the type. To keep the word in the title, give a type first: `/callout info Tip of the day`.
+- **`/todostyle`** switches how todos are saved. It is remembered across restarts.
+  - `header` (default): Notesnook's task list, with a title bar, a progress bar and a `checked/total` count. The line above the todos becomes the title.
+  - `simple`: a plain checklist with no header or count. The line above the todos stays in the note as normal text.
+  - Send `/todostyle` to switch, or `/todostyle header` or `/todostyle simple` to set one directly. `/ver` shows the current style.
+  - The style applies to todos in normal messages and in `/callout` bodies. It does not change `/html`, which sends your markup as typed.
+  - The setting is stored in the tag file, so it survives redeploys when a Fly volume is mounted. The tag backup file does not include it, so set the style again after a `/restore`.
+
+### Improvements
+
+- **Syntax highlighting for embedded text files.** Files sent to the bot now get a code language by extension: `.py`, `.js`, `.ts`, `.json`, `.yaml` and `.yml`, `.sh`, `.sql`, `.md` and `.markdown`, `.css`, `.toml`, `.ini`, `.csv`, and `.html` and `.xml` (saved as Notesnook's `markup`). Other file types stay plain text.
+- **Help and menus.** `/help` has new HTML, CALLOUTS and TODO STYLE sections, and the photos-and-files section mentions highlighting. `/html`, `/callout` and `/todostyle` appear in the Telegram command menu. `/cancel` also stops a `/callout` prompt.
+- **Version.** The bot and the `/setup` text now report 1.4.0.
+- **Guide catch-up.** This guide now also covers features from 1.3.1 that it had been missing: `/tag` and `/untag` ask for any missing details when sent on their own, and `/cancel` stops one of those prompts.
+
+### Upgrading from 1.3
+
+1. Replace `bot.py` with the 1.4.0 version.
+2. Run `fly deploy`. No new secrets or dependencies are needed.
+3. Send `/ver` and check that it reports `v1.4.0` and `Todo style: header`.
+4. Test with a todo list, for example:
+
+   ```
+   Groceries:
+   - [ ] milk
+   - [x] eggs
+   ```
+
+   The checklist header should read `1/2`. Notes saved before the upgrade keep their old count.
+
+### Good to know
+
+- **A tag shows as applied, but the note has no tag.** The bot's "tags: name" reply only means it sent a saved tag ID. Notesnook silently skips any tag ID that does not exist in the account it syncs with. Tag IDs are per account, so if you switch between default and self-hosted Notesnook, copy each tag's ID again (right-click the tag, then Copy ID) and re-save it with `/tag name id`.
+- **Extra tags in Telegram's `#` list.** The suggestions come from Telegram itself, which offers hashtags you have used in your chats. They do not come from the bot. `/tags` lists the tags the bot knows.
 
 ## Default or self-hosted Notesnook?
 
@@ -117,6 +176,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -139,7 +199,7 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 INBOX_KEY = os.environ["NOTESNOOK_INBOX_KEY"]
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 TIMEZONE = os.environ.get("BOT_TIMEZONE", "America/New_York")  # for generic titles
-__version__ = "1.3.0"  # bump when you change the bot; shown by /ver
+__version__ = "1.4.0"  # bump when you change the bot; shown by /ver
 
 ATTACHMENT_SIZE_LIMIT = 5 * 1024 * 1024  # per file, same as the email worker
 NOTE_SIZE_LIMIT = 8_000_000  # bytes of HTML per note (the Inbox API allows 10 MB)
@@ -163,6 +223,26 @@ _TEXT_MIMES = {
 _TEXT_EXTS = {
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml",
     ".toml", ".ini", ".log", ".py", ".js", ".ts", ".html", ".css", ".sh", ".sql",
+}
+# File extension -> Notesnook code block language (names from Notesnook's own
+# language list). Extensions not listed stay plain text.
+_CODE_LANGUAGES = {
+    ".py": "python",
+    ".js": "javascript",
+    ".ts": "typescript",
+    ".json": "json",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".sh": "bash",
+    ".sql": "sql",
+    ".md": "markdown",
+    ".markdown": "markdown",
+    ".css": "css",
+    ".toml": "toml",
+    ".ini": "ini",
+    ".csv": "csv",
+    ".html": "markup",  # Notesnook's name for HTML/XML
+    ".xml": "markup",
 }
 
 # Telegram-only tags Notesnook doesn't know; drop the tag, keep the text.
@@ -257,6 +337,12 @@ def _structured_html(tg_html: str) -> str | None:
     def next_is_task(idx: int) -> bool:
         return idx < len(parsed) and parsed[idx][0] == "task"
 
+    # "header": Notesnook's task list (title bar and checked/total count).
+    # "simple": the plain checklist, no header, so a line above stays as text.
+    header_style = get_todo_style() == "header"
+    item_class = "checklist--item" if header_style else "simple-checklist--item"
+    list_class = "checklist" if header_style else "simple-checklist"
+
     out = []
     pending_title = None  # line directly above a checklist -> its header title
     i = 0
@@ -265,7 +351,7 @@ def _structured_html(tg_html: str) -> str | None:
         if kind == "blank":
             i += 1
         elif kind == "heading":
-            if next_is_task(i + 1) and _plain_title(text):
+            if header_style and next_is_task(i + 1) and _plain_title(text):
                 pending_title = text
             else:
                 out.append(f"<h{extra}>{text}</h{extra}>")
@@ -274,10 +360,18 @@ def _structured_html(tg_html: str) -> str | None:
             items = []
             while i < len(parsed) and parsed[i][0] == kind:
                 _, t, checked = parsed[i]
-                items.append(f'<li class="checked">{t}</li>' if checked else f"<li>{t}</li>")
+                if kind == "task":
+                    # Same classes Notesnook itself writes. Without the item
+                    # class, the task list header counts 0 items.
+                    cls = f"{item_class} checked" if checked else item_class
+                    items.append(f'<li class="{cls}">{t}</li>')
+                else:
+                    items.append(f"<li>{t}</li>")
                 i += 1
             opener = {
-                "task": '<ul class="checklist"' + _title_attr(pending_title) + ">",
+                "task": f'<ul class="{list_class}"'
+                + (_title_attr(pending_title) if header_style else "")
+                + ">",
                 "bullet": "<ul>",
                 "ordered": "<ol>",
             }[kind]
@@ -289,7 +383,7 @@ def _structured_html(tg_html: str) -> str | None:
             while i < len(parsed) and parsed[i][0] == "text":
                 run.append(parsed[i][1])
                 i += 1
-            if next_is_task(i) and _plain_title(run[-1]):
+            if header_style and next_is_task(i) and _plain_title(run[-1]):
                 pending_title = run.pop()
             if run:
                 out.append("<p>" + "<br>".join(run) + "</p>")
@@ -374,7 +468,9 @@ async def embed_attachment(msg: Message) -> tuple[str | None, str | None]:
     if b"\x00" in data:
         return None, "file looks binary, not text"
     text = data.decode("utf-8", errors="replace")
-    return f"{heading}<pre><code>{html.escape(text, quote=False)}</code></pre>", None
+    lang = _CODE_LANGUAGES.get(os.path.splitext(name or "")[1].lower())
+    code_open = f'<code class="language-{lang}">' if lang else "<code>"
+    return f"{heading}<pre>{code_open}{html.escape(text, quote=False)}</code></pre>", None
 
 
 def build_note(
@@ -580,6 +676,25 @@ def remove_tag(name: str) -> bool:
         return True
 
 
+TODO_STYLES = ("header", "simple")
+
+
+def get_todo_style() -> str:
+    """How todos are saved: "header" (task list with title and count, the default)
+    or "simple" (plain checklist). Stored in the same file as the tags."""
+    with _tags_lock:
+        style = _tags_locked().get("todo_style")
+    return style if style in TODO_STYLES else "header"
+
+
+def set_todo_style(style: str) -> None:
+    with _tags_lock:
+        state = _tags_locked()
+        state["todo_style"] = style
+        _log(state, "todo style", style)
+        _save_tags_locked()
+
+
 def replace_tags(tags: dict) -> int:
     with _tags_lock:
         state = _tags_locked()
@@ -660,6 +775,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg is None or update.effective_user.id != ALLOWED_USER_ID:
         return  # ignore everyone else
 
+    if await handle_pending(update, context):
+        return  # this message answered a /tag or /untag prompt
+
     attachment_html, problem = None, None
     if media_label(msg):
         attachment_html, problem = await embed_attachment(msg)
@@ -709,8 +827,12 @@ COMMANDS
 /help   show this guide
 /setup  how to connect the bot to Notesnook (default or self-hosted)
 /ver    show the bot version and where notes are going
-/tag    save a tag: /tag name id
-/untag  forget a tag: /untag name
+/html   save raw HTML as a note (see HTML below)
+/callout  save a callout box (see CALLOUTS below)
+/todostyle  switch todos between a header task list and a simple checklist
+/tag    save a tag: /tag name id (or just /tag, and the bot asks)
+/untag  forget a tag: /untag name (or just /untag)
+/cancel stop a /tag, /untag or /callout prompt
 /tags   list saved tags
 /tagsfile  send the saved tags as a backup file
 
@@ -729,6 +851,11 @@ Groceries:
 
 A line directly above a todo list, with no blank line between, becomes the title of that checklist. In the example, "Groceries" is the checklist title.
 
+TODO STYLE
+Todos are saved in one of two styles. Send /todostyle to switch between them (or /todostyle header, /todostyle simple). The choice is remembered.
+• header (default): Notesnook's task list, with a title bar, a progress bar and a checked/total count.
+• simple: a plain checklist with no header or count. The line above the todos stays in the note as normal text.
+
 NOTE TITLES
 The first line of a message is the note title. A message that starts with a list item gets a title with the date and time instead, like "Telegram note, Oct 15, 8:15 AM".
 
@@ -736,7 +863,15 @@ FORMATTING
 Select text and use Telegram's formatting options to apply bold, italic, underline, strikethrough, links, monospace (code) and quotes. All of these carry over to the note. Spoiler text is saved as plain text.
 
 HTML
-Tags typed by hand, such as <b>, are not interpreted and appear in the note as plain text. Use Telegram's formatting options instead.
+In a normal message, tags typed by hand, such as <b>, are not interpreted and appear in the note as plain text. To save real HTML, start the message with /html:
+/html <h1>Groceries</h1><ul class="checklist"><li class="checklist--item">milk</li><li class="checklist--item checked">eggs</li></ul>
+The HTML is sent exactly as typed. The note title is the first heading (<h1> to <h6>), or the date and time if there is none. Every tag must be closed, or the bot refuses to save it (Notesnook would turn the note into a code block). A #tag on the last line works as usual. Checklist items need class="checklist--item", plus "checked" when done.
+
+CALLOUTS
+Send /callout on its own and the bot asks for the type, the title and the text, one message each (send skip to leave one out, /cancel to stop). Or do it in one message: start with /callout, then an optional type and a title, then the body on the next lines:
+/callout warning Back up first
+Export your notes before upgrading.
+Types: note, abstract, summary, tldr, info, todo, tip, hint, important, success, check, done, question, help, faq, warning, warn, caution, attention, failure, fail, missing, danger, error, bug, example, quote, cite. With no type, or an unknown one, the callout is info. With no title, the type name is used. The body can use lists, todos and Telegram formatting. The whole message becomes the callout, and the note title is the callout title. A #tag on the last line works as usual.
 
 TAGS
 Put tags on the last line of a message, after your text:
@@ -754,7 +889,7 @@ A tag the bot doesn't know stays in the note as text, and the reply says it was 
 
 PHOTOS AND FILES
 • Photos and image files (JPEG, PNG, GIF, WebP) are embedded in the note.
-• Text files (.txt, .md, .csv, .json, code and similar) are added as code blocks.
+• Text files (.txt, .md, .csv, .json, code and similar) are added as code blocks. Common types (.py, .js, .ts, .json, .yaml, .sh, .sql, .md, .css, .toml, .ini, .csv, .html, .xml) get syntax highlighting.
 • Files can be up to 5 MB each.
 • Videos, voice notes and other file types are not embedded. The note shows a placeholder line, plus the caption if there is one.
 • Embedded images are part of the note itself, not Notesnook attachments. To save a real attachment, share the file to Notesnook from your phone's share sheet.
@@ -765,7 +900,7 @@ LIMITS
 • A message that contains a code block, a quote, or bold text spanning several lines is saved as simple text, without list conversion."""
 
 
-SETUP_TEXT = """Setup: connecting the bot to Notesnook (v1.3)
+SETUP_TEXT = """Setup: connecting the bot to Notesnook (v1.4.0)
 
 The bot can send notes to ONE of two places. Which one is decided by a single setting, NOTESNOOK_SERVER_URL.
 
@@ -808,14 +943,30 @@ def _authorized(update: Update) -> bool:
     return user is not None and user.id == ALLOWED_USER_ID
 
 
+def _chunks(text: str, limit: int = 3800) -> list[str]:
+    """Split text at blank lines into pieces under Telegram's 4096-character cap."""
+    parts, current = [], ""
+    for block in text.split("\n\n"):
+        if current and len(current) + len(block) + 2 > limit:
+            parts.append(current)
+            current = block
+        else:
+            current = f"{current}\n\n{block}" if current else block
+    if current:
+        parts.append(current)
+    return parts
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _authorized(update):
-        await update.effective_message.reply_text(HELP_TEXT)
+        for part in _chunks(HELP_TEXT):
+            await update.effective_message.reply_text(part)
 
 
 async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _authorized(update):
-        await update.effective_message.reply_text(SETUP_TEXT)
+        for part in _chunks(SETUP_TEXT):
+            await update.effective_message.reply_text(part)
 
 
 async def send_backup(msg: Message, reason: str) -> None:
@@ -832,44 +983,147 @@ async def send_backup(msg: Message, reason: str) -> None:
         await msg.reply_text(f"Could not send the tag backup ({type(e).__name__}).")
 
 
-async def cmd_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update):
-        return
-    msg = update.effective_message
-    args = context.args or []
-    if len(args) != 2:
-        await msg.reply_text(
-            "Usage: /tag name id\n"
-            "Example: /tag groceries 67aecf3b9e1398484554bc90\n"
-            "In Notesnook, right-click the tag and choose Copy ID."
-        )
-        return
-    name, tag_id = args[0].lstrip("#").lower(), args[1].strip()
+PENDING = "pending"  # key in context.user_data: a command waiting for your next message
+PENDING_SECONDS = 300  # a forgotten prompt stops swallowing messages after 5 minutes
+ASK_NAME = "Which tag name? Use letters, numbers, - and _. Send /cancel to stop."
+ASK_ID = (
+    'Now send the tag ID for "{name}". In Notesnook, right-click the tag and '
+    "choose Copy ID. Send /cancel to stop."
+)
+
+
+def _wait_for(context: ContextTypes.DEFAULT_TYPE, cmd: str, **extra) -> None:
+    context.user_data[PENDING] = {"cmd": cmd, "at": time.time(), **extra}
+
+
+async def save_tag(msg: Message, name_raw: str, id_raw: str) -> bool:
+    """Validate and save a tag, then send the backup. False if input was invalid."""
+    name, tag_id = name_raw.lstrip("#").lower(), id_raw.strip()
     if not TAG_NAME.match(name):
         await msg.reply_text("Tag names can use letters, numbers, - and _ (up to 40).")
-        return
+        return False
     if not TAG_ID.match(tag_id):
         await msg.reply_text("That doesn't look like a tag ID. Use Copy ID in Notesnook.")
-        return
+        return False
     result = set_tag(name, tag_id)
     await msg.reply_text(f'Tag "{name}" {result}.')
     await send_backup(msg, f"after /tag {name}")
+    return True
 
 
-async def cmd_untag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def forget_tag(msg: Message, name_raw: str) -> bool:
+    name = name_raw.lstrip("#").lower()
+    if remove_tag(name):
+        await msg.reply_text(f'Tag "{name}" forgotten. It is not deleted in Notesnook.')
+        await send_backup(msg, f"after /untag {name}")
+        return True
+    await msg.reply_text(f'No saved tag named "{name}". Send /tags to see them.')
+    return False
+
+
+async def handle_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Use the message as the answer to a /tag, /untag or /callout prompt. True if it was."""
+    pend = context.user_data.get(PENDING)
+    if not pend:
+        return False
+    msg = update.effective_message
+    text = (msg.text or "").strip()
+    if time.time() - pend["at"] > PENDING_SECONDS or not text:
+        context.user_data.pop(PENDING, None)  # expired, or not text: save it as a note
+        return False
+    if pend["cmd"] == "tag_name":
+        name = text.lstrip("#").lower()
+        if not TAG_NAME.match(name):
+            await msg.reply_text("Tag names can use letters, numbers, - and _ (up to 40). Try again, or /cancel.")
+        else:
+            _wait_for(context, "tag_id", name=name)
+            await msg.reply_text(ASK_ID.format(name=name))
+    elif pend["cmd"] == "tag_id":
+        if await save_tag(msg, pend["name"], text):
+            context.user_data.pop(PENDING, None)
+        else:
+            await msg.reply_text("Try again, or /cancel.")
+    elif pend["cmd"] == "untag":
+        context.user_data.pop(PENDING, None)
+        await forget_tag(msg, text)
+    elif pend["cmd"] == "callout_type":
+        word = text.lower()
+        if word in ("skip", "-"):
+            word = "info"
+        if word not in _CALLOUT_TYPES:
+            await msg.reply_text(
+                "That is not a callout type. Try note, info, tip, warning or danger "
+                "(full list in /help), send skip for info, or /cancel."
+            )
+        else:
+            _wait_for(context, "callout_title", ctype=word)
+            await msg.reply_text(ASK_CALLOUT_TITLE)
+    elif pend["cmd"] == "callout_title":
+        title = "" if text.lower() == "skip" else " ".join((msg.text_html or "").split())
+        _wait_for(context, "callout_body", ctype=pend["ctype"], title=title)
+        await msg.reply_text(ASK_CALLOUT_BODY)
+    elif pend["cmd"] == "callout_body":
+        context.user_data.pop(PENDING, None)
+        if text.lower() == "skip":
+            tag_names, body = [], ""
+        else:
+            tag_names, body = _callout_tags(msg.text_html or "")
+        note_title, content_html = _callout_html(pend["ctype"], pend["title"], body)
+        await _save_callout(msg, note_title, content_html, tag_names)
+    return True
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    had = context.user_data.pop(PENDING, None)
+    await update.effective_message.reply_text("Cancelled." if had else "Nothing to cancel.")
+
+
+async def cmd_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tag name id saves a tag. With less, the bot asks for the rest."""
     if not _authorized(update):
         return
     msg = update.effective_message
     args = context.args or []
-    if len(args) != 1:
-        await msg.reply_text("Usage: /untag name")
-        return
-    name = args[0].lstrip("#").lower()
-    if remove_tag(name):
-        await msg.reply_text(f'Tag "{name}" forgotten. It is not deleted in Notesnook.')
-        await send_backup(msg, f"after /untag {name}")
+    context.user_data.pop(PENDING, None)
+    if len(args) == 2:
+        await save_tag(msg, args[0], args[1])
+    elif len(args) == 1:
+        name = args[0].lstrip("#").lower()
+        if not TAG_NAME.match(name):
+            await msg.reply_text("Tag names can use letters, numbers, - and _ (up to 40).")
+            return
+        _wait_for(context, "tag_id", name=name)
+        await msg.reply_text(ASK_ID.format(name=name))
+    elif not args:
+        _wait_for(context, "tag_name")
+        await msg.reply_text(ASK_NAME)
     else:
-        await msg.reply_text(f'No saved tag named "{name}". Send /tags to see them.')
+        await msg.reply_text("Usage: /tag name id")
+
+
+async def cmd_untag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/untag name forgets a tag. With no name, the bot lists them and asks."""
+    if not _authorized(update):
+        return
+    msg = update.effective_message
+    args = context.args or []
+    context.user_data.pop(PENDING, None)
+    if len(args) == 1:
+        await forget_tag(msg, args[0])
+    elif not args:
+        tags = get_tags()
+        if not tags:
+            await msg.reply_text("No tags saved yet.")
+            return
+        _wait_for(context, "untag")
+        await msg.reply_text(
+            "Which tag should be forgotten? Send its name, or /cancel.\n\n"
+            + "\n".join(sorted(tags))
+        )
+    else:
+        await msg.reply_text("Usage: /untag name")
 
 
 async def cmd_tags(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -936,7 +1190,263 @@ async def cmd_ver(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     lines.append(f"Time zone for generic titles: {TIMEZONE}")
     lines.append(f"Media embedding: {'on' if EMBED_MEDIA else 'off'}")
+    lines.append(f"Todo style: {get_todo_style()} (change with /todostyle)")
     await update.effective_message.reply_text("\n".join(lines))
+
+
+_VOID_TAGS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+    "param", "source", "track", "wbr",
+}
+_HTML_TAG = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9-]*)\b[^>]*?(/?)>")
+_HTML_HEADING = re.compile(r"<h[1-6]\b[^>]*>(.*?)</h[1-6]>", re.IGNORECASE | re.DOTALL)
+_HTML_COMMAND = re.compile(r"^/html(?:@\w+)?[ \t]*\n?", re.IGNORECASE)
+
+
+def _html_balanced(raw: str) -> bool:
+    """True if every non-void tag in raw HTML is closed in the right order.
+
+    Notesnook saves a note as a code block when tags are unbalanced, so the bot
+    checks first and refuses instead of saving a mangled note.
+    """
+    stripped = re.sub(r"<!--.*?-->", "", raw, flags=re.DOTALL)
+    stack = []
+    for m in _HTML_TAG.finditer(stripped):
+        closing, name, self_closing = m.group(1), m.group(2).lower(), m.group(3)
+        if name in _VOID_TAGS or self_closing:
+            continue
+        if closing:
+            if not stack or stack.pop() != name:
+                return False
+        else:
+            stack.append(name)
+    return not stack
+
+
+def _html_title(msg: Message, raw: str) -> str:
+    """Title for a /html note: the first heading's text, else a generic title."""
+    if m := _HTML_HEADING.search(raw):
+        plain = html.unescape(re.sub(r"<[^>]+>", "", m.group(1))).strip().rstrip(":").strip()
+        if plain:
+            return (plain[:80] + "…") if len(plain) > 80 else plain
+    return generic_title(msg)
+
+
+async def cmd_html(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/html <raw HTML>: save the HTML exactly as typed (no escaping)."""
+    msg = update.effective_message
+    if msg is None or not _authorized(update):
+        return
+    raw = _HTML_COMMAND.sub("", msg.text or "", count=1).strip()
+    if not raw:
+        await msg.reply_text(
+            "Send /html followed by your HTML, for example:\n"
+            "/html <h1>Groceries</h1><ul class=\"checklist\">"
+            "<li class=\"checklist--item\">milk</li></ul>"
+        )
+        return
+
+    # Optional #tag line at the end, same rule as normal notes.
+    lines = raw.split("\n")
+    tag_names: list[str] = []
+    if len(lines) >= 2:
+        tokens = lines[-1].split()
+        if tokens and all(TAG_TOKEN.match(t) for t in tokens):
+            tag_names = list(dict.fromkeys(t[1:].lower() for t in tokens))
+    known = get_tags()
+    applied = [n for n in tag_names if n in known]
+    unknown = [n for n in tag_names if n not in known]
+    if tag_names and not unknown:
+        raw = "\n".join(lines[:-1]).strip()  # remove the tag line
+
+    if not _html_balanced(raw):
+        await msg.reply_text(
+            "Not saved: the HTML has an unclosed or mismatched tag. "
+            "Notesnook would turn the whole note into a code block. "
+            "Fix the tags and send it again."
+        )
+        return
+
+    title = _html_title(msg, raw)
+    try:
+        resp = await asyncio.to_thread(
+            send_to_notesnook, title, raw, [known[n] for n in applied]
+        )
+    except requests.RequestException as e:
+        await msg.reply_text(f"Network error: {e}")
+        return
+
+    if resp.status_code == 200:
+        text = "✓ Saved to Notesnook (raw HTML)"
+        if applied:
+            text += f" (tags: {', '.join(applied)})"
+        if unknown:
+            names = ", ".join("#" + n for n in unknown)
+            text += f"\nTag not found: {names}. Add it with /tag name id"
+        await msg.reply_text(text)
+    else:
+        await msg.reply_text(f"Failed ({resp.status_code}): {resp.text[:300]}")
+
+
+# Callout types Notesnook knows (from its editor source). Unknown types fall back to info.
+_CALLOUT_TYPES = {
+    "note", "abstract", "summary", "tldr", "info", "todo", "tip", "hint",
+    "important", "success", "check", "done", "question", "help", "faq",
+    "warning", "warn", "caution", "attention", "failure", "fail", "missing",
+    "danger", "error", "bug", "example", "quote", "cite",
+}
+_CALLOUT_COMMAND = re.compile(r"^/callout(?:@\w+)?[ \t]*\n?", re.IGNORECASE)
+_CALLOUT_FIRST = re.compile(r"^([A-Za-z]+)(?:[ \t]+(.*))?$")
+
+
+def build_callout(rich: str) -> tuple[str, str] | None:
+    """Turn the text after /callout into (note title, callout HTML).
+
+    First line: optional type, then the title. Remaining lines: the body, which
+    can use lists, todos and Telegram formatting like a normal message.
+    Returns None when there is nothing after the command.
+    """
+    rest = _CALLOUT_COMMAND.sub("", rich.strip(), count=1).strip()
+    if not rest:
+        return None
+    first, _, body = rest.partition("\n")
+    first, body = first.strip(), body.strip()
+    if not (_balanced(first) and _balanced(body)):
+        # Formatting runs across the title/body split; keep the text, drop the
+        # tags so the HTML stays balanced (Notesnook rejects unbalanced HTML).
+        first, body = _TAG.sub("", first), _TAG.sub("", body)
+
+    ctype, title = "info", first
+    if (m := _CALLOUT_FIRST.match(first)) and m.group(1).lower() in _CALLOUT_TYPES:
+        ctype, title = m.group(1).lower(), (m.group(2) or "").strip()
+    return _callout_html(ctype, title, body)
+
+
+def _callout_html(ctype: str, title: str, body: str) -> tuple[str, str]:
+    """(note title, callout HTML) from a type, a title and a body (Telegram HTML)."""
+    if not title:
+        title = ctype.upper()  # Notesnook's default title is the type name
+    body_html = telegram_html_to_note_html(_TG_ONLY_TAGS.sub("", body)) if body else "<p></p>"
+    callout = (
+        f'<div class="callout" data-callout-type="{ctype}">'
+        f"<h4>{title}</h4>{body_html}</div>"
+    )
+    plain_title = _plain_title(title) or ctype.upper()
+    note_title = (plain_title[:80] + "…") if len(plain_title) > 80 else plain_title
+    return note_title, callout
+
+
+def _callout_tags(rich: str) -> tuple[list[str], str]:
+    """Find tags at the end of a callout message (Telegram HTML in, HTML out).
+
+    Accepts a last line made only of #tags (removed when they are all saved
+    tags), or saved #tags at the end of the last line, so
+    "/callout tip Title #home" works too. Returns (tag names, text without them).
+    """
+    lines = rich.rstrip().split("\n")
+    known = get_tags()
+    last = lines[-1]
+    tokens = html.unescape(_TAG.sub("", last)).split()
+    if tokens and "<" not in last and all(TAG_TOKEN.match(t) for t in tokens):
+        names = list(dict.fromkeys(t[1:].lower() for t in tokens))
+        if all(n in known for n in names):
+            return names, "\n".join(lines[:-1]).strip()
+        return names, rich  # an unknown tag: keep the text, the reply says so
+    found: list[str] = []
+    text = last
+    while (m := re.search(r"(?:^|\s)#([\w-]{1,40})\s*$", text)) and m.group(1).lower() in known:
+        found.insert(0, m.group(1).lower())
+        text = text[: m.start()].rstrip()
+    if found:
+        return found, "\n".join(lines[:-1] + [text]).strip()
+    return [], rich
+
+
+ASK_CALLOUT_TYPE = (
+    "Which callout type? For example: note, info, tip, warning, danger, success, "
+    "question, example (the full list is in /help). Send skip for info, or /cancel to stop."
+)
+ASK_CALLOUT_TITLE = "What is the callout's title? Send skip to use the type name, or /cancel to stop."
+ASK_CALLOUT_BODY = (
+    "What is the callout's text? Lists, todos and Telegram formatting work. "
+    "A #tag on the last line is applied. Send skip for no text, or /cancel to stop."
+)
+
+
+async def _save_callout(
+    msg: Message, title: str, content_html: str, tag_names: list[str]
+) -> None:
+    """Send a callout note to Notesnook and report the result."""
+    known = get_tags()
+    applied = [n for n in tag_names if n in known]
+    unknown = [n for n in tag_names if n not in known]
+    try:
+        resp = await asyncio.to_thread(
+            send_to_notesnook, title, content_html, [known[n] for n in applied]
+        )
+    except requests.RequestException as e:
+        await msg.reply_text(f"Network error: {e}")
+        return
+
+    if resp.status_code == 200:
+        text = "✓ Saved to Notesnook (callout)"
+        if applied:
+            text += f" (tags: {', '.join(applied)})"
+        if unknown:
+            names = ", ".join("#" + n for n in unknown)
+            text += f"\nTag not found: {names}. Add it with /tag name id"
+        await msg.reply_text(text)
+    else:
+        await msg.reply_text(f"Failed ({resp.status_code}): {resp.text[:300]}")
+
+
+async def cmd_callout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/callout [type] [title] then body lines. With nothing after it, the bot asks."""
+    msg = update.effective_message
+    if msg is None or not _authorized(update):
+        return
+    context.user_data.pop(PENDING, None)
+
+    tag_names, rich = _callout_tags(msg.text_html or "")
+
+    built = build_callout(rich)
+    if built is None:
+        _wait_for(context, "callout_type")
+        await msg.reply_text(ASK_CALLOUT_TYPE)
+        return
+    title, content_html = built
+    await _save_callout(msg, title, content_html, tag_names)
+
+
+async def cmd_todostyle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/todostyle switches between the header task list and the simple checklist."""
+    if not _authorized(update):
+        return
+    msg = update.effective_message
+    args = [a.lower() for a in (context.args or [])]
+    current = get_todo_style()
+    if args and args[0] in TODO_STYLES:
+        new = args[0]
+    elif not args:
+        new = "simple" if current == "header" else "header"  # no argument: toggle
+    else:
+        await msg.reply_text("Usage: /todostyle, /todostyle header or /todostyle simple")
+        return
+    if new != current:
+        try:
+            set_todo_style(new)
+        except OSError as e:
+            await msg.reply_text(f"Could not save the setting ({type(e).__name__}).")
+            return
+    desc = (
+        "header: a task list with a title and a checked/total count"
+        if new == "header"
+        else "simple: a plain checklist, with no header or count"
+    )
+    note = "" if new != current else " (no change)"
+    if not TAGS_PERSISTENT:
+        note += "\nNo Fly volume is mounted, so this resets when the bot redeploys."
+    await msg.reply_text(f"Todo style is now {desc}.{note}\nSend /todostyle again to switch.")
 
 
 async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -949,7 +1459,10 @@ async def post_init(app: Application):
         [
             BotCommand("help", "How to use this bot"),
             BotCommand("setup", "Connect to default or self-hosted Notesnook"),
-            BotCommand("tag", "Save a tag: /tag name id"),
+            BotCommand("html", "Save raw HTML as a note"),
+            BotCommand("callout", "Save a callout (type, title, body)"),
+            BotCommand("todostyle", "Switch todos: header or simple checklist"),
+            BotCommand("tag", "Save a tag (the bot asks for details)"),
             BotCommand("untag", "Forget a saved tag"),
             BotCommand("tags", "List saved tags"),
             BotCommand("tagsfile", "Send the tag backup file"),
@@ -969,11 +1482,15 @@ def main():
     )
     app.add_handler(CommandHandler(["start", "help"], cmd_help))
     app.add_handler(CommandHandler("setup", cmd_setup))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("tag", cmd_tag))
     app.add_handler(CommandHandler("untag", cmd_untag))
     app.add_handler(CommandHandler("tags", cmd_tags))
     app.add_handler(CommandHandler("tagsfile", cmd_tagsfile))
     app.add_handler(CommandHandler("ver", cmd_ver))
+    app.add_handler(CommandHandler("html", cmd_html))
+    app.add_handler(CommandHandler("callout", cmd_callout))
+    app.add_handler(CommandHandler("todostyle", cmd_todostyle))
     app.add_handler(
         MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"^/restore\b"), cmd_restore)
     )
@@ -1107,6 +1624,9 @@ Try these in order:
 | --- | --- |
 | `Hello world` | A note titled "Hello world" |
 | A message starting with `- [ ] milk` | A checklist note titled like "Telegram note, Oct 15, 8:15 AM" |
+| `/todostyle` | A reply saying the todo style is now simple. Send it again to switch back to header |
+| `/callout warning Test` and then a line of text on the next line | A note titled "Test" containing a warning callout |
+| `/html <h1>Hi</h1><p>Some <b>bold</b> text</p>` | A note titled "Hi" with the bold text formatted |
 | A photo with the caption `Receipt` | A note titled "Receipt" with the photo embedded, and the reply "✓ Saved to Notesnook (media embedded)" |
 
 Then send this as one message:
@@ -1117,11 +1637,11 @@ Groceries:
 - [x] eggs
 ```
 
-You should get a note titled "Groceries" containing a checklist whose header also reads "Groceries", with milk unchecked and eggs checked.
+You should get a note titled "Groceries" containing a checklist whose header also reads "Groceries", with milk unchecked and eggs checked. The header's counter should read 1/2. (Send `/todostyle header` first if you changed the style.)
 
 **Self-hosted:** send `/ver` first and check that Destination shows your server address. Then send a test message. "✓ Saved to Notesnook" means your server accepted the encrypted note. Sync Notesnook while logged in to the self-hosted account to see it.
 
-**Tags (optional):** send `/ver`; it should say `Saved tags: 0 (on a Fly volume)`. In Notesnook, right-click a tag and choose **Copy ID**, then send `/tag groceries <the id>`. The bot confirms and sends you a backup file. Then send a note whose last line is `#groceries`. The reply should end with "(tags: groceries)", and the note should carry that tag after a sync.
+**Tags (optional):** send `/ver`; it should say `Saved tags: 0 (on a Fly volume)`. In Notesnook, right-click a tag and choose **Copy ID**, then send `/tag groceries <the id>`. The bot confirms and sends you a backup file. Then send a note whose last line is `#groceries`. The reply should end with "(tags: groceries)", and the note should carry that tag after a sync. The reply only means the bot found a saved ID and sent it. If the note arrives without the tag, the ID doesn't exist in the Notesnook account you sync with. Copy it again from that account.
 
 Two last checks:
 
@@ -1143,13 +1663,24 @@ Formatting you apply in Telegram (bold, italic, underline, strikethrough, links,
 
 **Titles.** The first line of your message becomes the note title. If the message starts with a list item, the title is generic instead, like "Telegram note, Oct 15, 8:15 AM", so the first item isn't repeated as the title.
 
-**Commands.** Send `/help` to see a usage guide inside Telegram, including these markdown shortcuts. Send `/ver` to see the bot's version, the Fly.io region it runs in, its time zone and whether media embedding is on.
+**Commands.** Send `/help` to see a usage guide inside Telegram, including these markdown shortcuts. The commands are:
+
+| Command | What it does |
+| --- | --- |
+| `/help` | Shows the usage guide (it arrives in more than one message when it is long) |
+| `/setup` | Shows how to connect the bot to default or self-hosted Notesnook |
+| `/ver` | Shows the bot's version, the Fly.io region, the destination, the saved tag count, the time zone, whether media embedding is on and the todo style |
+| `/html` | Saves the HTML that follows as a note, exactly as typed |
+| `/callout` | Saves a callout box, in one message or by answering prompts |
+| `/todostyle` | Switches todos between a header task list and a simple checklist |
+| `/tag`, `/untag`, `/tags`, `/tagsfile` | Manage the saved tags (see Tags below) |
+| `/cancel` | Stops a `/tag`, `/untag` or `/callout` prompt |
 
 **Setup help.** Send `/setup` for a short guide to connecting the bot to default or self-hosted Notesnook, including where to create the key and which secrets to set.
 
 **Tags.** Put tags on the last line of a message, after your text, for example `#groceries #home`. The bot removes that line from the note and applies the matching Notesnook tags. A `#word` anywhere else is ordinary text, and a message that is only a tag is saved as a normal note.
 
-Notesnook gives the bot no way to read your tag list, so you save each tag once with `/tag name id`. Copy the ID in Notesnook by right-clicking the tag and choosing **Copy ID**. `/untag name` forgets a tag in the bot only; it never deletes it in Notesnook. `/tags` lists what is saved. A tag the bot doesn't know stays in the note as text, and the reply says it wasn't found.
+Notesnook gives the bot no way to read your tag list, so you save each tag once with `/tag name id`. Copy the ID in Notesnook by right-clicking the tag and choosing **Copy ID**. `/untag name` forgets a tag in the bot only; it never deletes it in Notesnook. `/tags` lists what is saved. Send `/tag` or `/untag` on its own and the bot asks for what it needs; `/cancel` stops the prompt. The `#` suggestions Telegram shows while you type come from Telegram, which offers hashtags you have used before. They are not the bot's list. A tag the bot doesn't know stays in the note as text, and the reply says it wasn't found.
 
 **Tag backups.** After every `/tag` and `/untag`, the bot sends you the tag file in Telegram. `/tagsfile` sends it on request. To restore, send the file back to the bot with the caption `/restore`. Fly also keeps daily snapshots of the volume for 5 days by default, but the copy in your chat is the one that survives losing the volume.
 
@@ -1161,9 +1692,39 @@ Groceries:
 - [ ] eggs
 ```
 
-With a blank line between, or no line above, the header reads "Untitled".
+With a blank line between, or no line above, the header reads "Untitled". The header's counter (for example 1/2) counts every item in the list, nested or not.
 
-**Photos and files.** The Inbox API has no attachment field, so the bot embeds media in the note's HTML, the way the Notesnook email worker does. Photos and image files (JPEG, PNG, GIF, WebP) become embedded images, and text files (.txt, .md, .csv, .json, code and similar) become code blocks. Each file can be up to 5 MB, and a whole note up to 8 MB. Videos, voice notes and other file types get a placeholder line such as "\[Video attached in Telegram, not embedded\]" plus the caption, if any. Each photo in an album becomes its own note. Embedded images are part of the note, not Notesnook attachments, and Notesnook's documentation suggests it may strip embedded images, but in testing they display correctly. If they ever stop appearing, run `fly secrets set EMBED_MEDIA=0` to switch embedding off, and use your phone's share sheet for real attachments.
+**Todo style.** Todos can be saved in one of two styles, and `/todostyle` switches between them. The choice is remembered.
+
+- **header** (the default): Notesnook's task list, with a title bar, a progress bar and the checked/total count. The line above the todos becomes the title.
+- **simple**: a plain checklist with no header or count. The line above the todos stays in the note as normal text.
+
+Send `/todostyle` to flip between them, or `/todostyle header` or `/todostyle simple` to set one directly. The style applies to todos in normal messages and in `/callout` bodies. It does not change `/html`. The setting is stored in the tag file on the Fly volume, so it survives redeploys. The tag backup file does not include it, so set the style again after a `/restore`.
+
+**Callouts.** `/callout` saves a Notesnook callout box. Start a message with `/callout`, then an optional type and a title, then the body on the next lines:
+
+```text
+/callout warning Back up first
+Export your notes before upgrading.
+```
+
+The types are note, abstract, summary, tldr, info, todo, tip, hint, important, success, check, done, question, help, faq, warning, warn, caution, attention, failure, fail, missing, danger, error, bug, example, quote and cite. With no type, or an unknown one, the callout is `info`. With no title, the type name is used. The body can use lists, todos and Telegram formatting, and the note title is the callout title.
+
+Send `/callout` on its own and the bot asks for the type, the title and the text, one message each. Send `skip` to leave a step out, or `/cancel` to stop. An unanswered prompt expires after 5 minutes.
+
+Tags work in a callout: put saved tags on a line of their own at the end, or at the end of the last line. Because the first word of the title is read as the type when it matches one, a title like "Tip of the day" needs a type in front: `/callout info Tip of the day`.
+
+**Raw HTML.** A normal message escapes any tags you type, so `<b>` appears as plain text. To save real HTML, start the message with `/html`:
+
+```text
+/html <h1>Groceries</h1><ul class="checklist"><li class="checklist--item">milk</li><li class="checklist--item checked">eggs</li></ul>
+```
+
+The HTML is sent as typed. The note title is the first heading (`<h1>` to `<h6>`), or the date and time if there is none. Every tag must be closed: the bot refuses to save HTML with an unclosed or mismatched tag, because Notesnook would turn the whole note into a code block. A saved `#tag` on the last line works as usual. Notesnook cleans the HTML on your device after it arrives, so unsafe parts such as scripts are removed.
+
+Notesnook only recognises some structures by their class names. Checklist items need `class="checklist--item"` (plus `checked` when done) inside `<ul class="checklist">`, and a callout is `<div class="callout" data-callout-type="info">` with a heading as its first child. A simple checklist uses `<ul class="simple-checklist">` and `<li class="simple-checklist--item">`.
+
+**Photos and files.** The Inbox API has no attachment field, so the bot embeds media in the note's HTML, the way the Notesnook email worker does. Photos and image files (JPEG, PNG, GIF, WebP) become embedded images, and text files (.txt, .md, .csv, .json, code and similar) become code blocks. Common types get syntax highlighting from their extension: .py, .js, .ts, .json, .yaml and .yml, .sh, .sql, .md and .markdown, .css, .toml, .ini, .csv, and .html and .xml. Other types stay plain text. Each file can be up to 5 MB, and a whole note up to 8 MB. Videos, voice notes and other file types get a placeholder line such as "\[Video attached in Telegram, not embedded\]" plus the caption, if any. Each photo in an album becomes its own note. Embedded images are part of the note, not Notesnook attachments, and Notesnook's documentation suggests it may strip embedded images, but in testing they display correctly. If they ever stop appearing, run `fly secrets set EMBED_MEDIA=0` to switch embedding off, and use your phone's share sheet for real attachments.
 
 **Limits.** Lists don't nest, and numbering always starts at 1. A message with a code block, a quote, or bold text that runs across several lines skips the list conversion and is saved as simple text, so nothing is lost.
 
@@ -1201,9 +1762,23 @@ Start with `fly logs`. It shows startup errors and every request the bot handles
 | --- | --- | --- |
 | Reply says "Tag not found" | The tag was never saved in the bot | Send `/tag name id` with the ID copied from Notesnook |
 | The `#tag` line stays in the note | The tag isn't saved yet, or the line isn't the last line | Save the tag, and put the tags alone on the last line |
-| Note saved but has no tag | Wrong tag ID, or it is from a different account | Copy the ID again from the account the bot sends to |
+| Reply says "(tags: name)" but the note has no tag | Notesnook silently skips a tag ID that doesn't exist in the account it syncs with. IDs are per account, so one saved from default Notesnook won't exist on a self-hosted server | Copy the ID again from the account the bot sends to, send `/tag name id`, and send a new note. Notes already saved need the tag added by hand |
+| `/callout` tag not applied | The tag isn't saved in the bot, or it isn't at the end of the message | Save it with `/tag`, and put it on its own last line or at the end of the last line |
+| Typing `#` shows tags you never saved | Telegram suggests hashtags you have used before | Nothing to fix. `/tags` lists what the bot knows |
 | `/ver` says "NOT persistent: no volume mounted" | The volume isn't attached | Check the `[mounts]` block in `fly.toml`, then run `fly deploy` |
 | Tags vanish after a deploy | The same: no volume | Create the volume, redeploy, then send the backup file back with `/restore` |
+
+### Commands and formatting
+
+| What you see | Likely cause | Fix |
+| --- | --- | --- |
+| The checklist header shows 0/2 although an item is checked | The note was saved by a bot older than 1.4.0, or by HTML without the `checklist--item` class | Update to 1.4.0 and send the note again. Notes already saved keep the old count. With `/html`, give each item `class="checklist--item"` |
+| `/html` replies "Not saved: the HTML has an unclosed or mismatched tag" | A tag isn't closed, or tags are closed in the wrong order | Fix the tags and send it again |
+| Your `<b>` or `<ul>` shows as plain text in the note | It was sent as a normal message, which escapes tags | Start the message with `/html` |
+| A `/callout` came out as `info`, or the first word of the title vanished | The first word was read as a type, or wasn't a known type | Put a type first, for example `/callout info Tip of the day` |
+| A todo list has no header | The todo style is `simple` | Send `/todostyle header` |
+| The todo style went back to `header` after a deploy | No Fly volume is mounted, so the setting wasn't kept | Create the volume (Step 4), redeploy, and set the style again |
+| A `.py` file shows as plain text | Only the listed file types are highlighted | Nothing to fix; see Photos and files |
 
 **Update the bot.** Edit `bot.py` and run `fly deploy` again.
 
@@ -1216,6 +1791,7 @@ Start with `fly logs`. It shows startup errors and every request the bot handles
 ## Limitations and security
 
 - **Attachments are embedded, not attached.** Photos and text files are embedded in the note. Videos, voice notes and other files get a placeholder line.
+- **`/html` is not escaped.** The bot sends your HTML as typed. Notesnook cleans it on your device, but only you can use the bot, so the content is yours.
 - **Beta API.** The Notesnook Inbox API may change. If the bot breaks after a Notesnook update, check the [official guide](https://help.notesnook.com/inbox-api/getting-started).
 - **One user per bot.** The bot answers a single Telegram user ID. Anyone who wants their own bridge should deploy their own copy with their own bot token and Inbox key.
 - **Protect your secrets.** Never put the bot token or Inbox key in `bot.py`, a Git repository or a screenshot. If either leaks, send `/revoke` to @BotFather for the bot token, and delete the key under Settings > Inbox in Notesnook.

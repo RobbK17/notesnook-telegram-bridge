@@ -10,7 +10,7 @@ primary_region = "iad"
   size = "shared-cpu-1x"
   memory = "256mb"
 
-# Keeps saved tags (/data/tags.json) across restarts and deploys.
+# Keeps saved tags and todo style (/data/tags.json) across restarts and deploys.
 # Create the volume once first: fly volumes create tagdata --region iad --size 1
 [mounts]
   source = "tagdata"
