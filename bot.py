@@ -55,7 +55,7 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 INBOX_KEY = os.environ["NOTESNOOK_INBOX_KEY"]
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 TIMEZONE = os.environ.get("BOT_TIMEZONE", "America/New_York")  # for generic titles
-__version__ = "1.4.0"  # bump when you change the bot; shown by /ver
+__version__ = "1.4.1"  # bump when you change the bot; shown by /ver
 
 ATTACHMENT_SIZE_LIMIT = 5 * 1024 * 1024  # per file, same as the email worker
 NOTE_SIZE_LIMIT = 8_000_000  # bytes of HTML per note (the Inbox API allows 10 MB)
@@ -756,7 +756,7 @@ LIMITS
 • A message that contains a code block, a quote, or bold text spanning several lines is saved as simple text, without list conversion."""
 
 
-SETUP_TEXT = """Setup: connecting the bot to Notesnook (v1.4.0)
+SETUP_TEXT = """Setup: connecting the bot to Notesnook (v1.4.1)
 
 The bot can send notes to ONE of two places. Which one is decided by a single setting, NOTESNOOK_SERVER_URL.
 
@@ -1088,6 +1088,19 @@ def _html_title(msg: Message, raw: str) -> str:
     return generic_title(msg)
 
 
+HTML_EXAMPLE = """Send /html followed by your HTML. Example (a task list with three items and a tag):
+
+/html <h1>Groceries</h1>
+<ul class="checklist" data-title="Groceries">
+  <li class="checklist--item">Milk</li>
+  <li class="checklist--item checked">Eggs</li>
+  <li class="checklist--item">Bread</li>
+</ul>
+#todo
+
+The note title is the first heading. Each item needs class="checklist--item", plus "checked" when done. data-title sets the checklist's header title. A saved tag on the last line is applied and removed from the note (save one first with /tag name id). Every tag must be closed."""
+
+
 async def cmd_html(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/html <raw HTML>: save the HTML exactly as typed (no escaping)."""
     msg = update.effective_message
@@ -1095,11 +1108,7 @@ async def cmd_html(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     raw = _HTML_COMMAND.sub("", msg.text or "", count=1).strip()
     if not raw:
-        await msg.reply_text(
-            "Send /html followed by your HTML, for example:\n"
-            "/html <h1>Groceries</h1><ul class=\"checklist\">"
-            "<li class=\"checklist--item\">milk</li></ul>"
-        )
+        await msg.reply_text(HTML_EXAMPLE)
         return
 
     # Optional #tag line at the end, same rule as normal notes.
